@@ -80,5 +80,3 @@ Changelog = "https://github.com/lyft/cartography/blob/master/CHANGELOG.md"
 
 
 [tool.black]
-
-
