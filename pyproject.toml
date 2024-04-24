@@ -77,6 +77,3 @@ Changelog = "https://github.com/lyft/cartography/blob/master/CHANGELOG.md"
 
 
 [project.optional-dependencies]
-
-
-[tool.black]
