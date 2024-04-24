@@ -2,12 +2,21 @@
 
 .. _kandji_schema:
 
+### KandjiTenant
+
+Representation of a Kandji Tenant.
+
+|Field | Description|
+|-------|-------------|
+| id | Kandji Tenant id e.g. "company name"|
+
 ### KandjiDevice
 
 Representation of a Kandji device.
 
 |Field | Description|
 |-------|-------------|
+|id | same as device_id|
 |device_id | Kandji device id|
 |device_name | The friendly name of the device|
 |last_check_in | Last time the device checked-in with Kandji|
@@ -18,4 +27,8 @@ Representation of a Kandji device.
 
 #### Relationships
 
-- Coming soon!
+- Kandji devices are enrolled to a Kandji Tenant
+
+    ```
+    (KandjiDevice)-[ENROLLED_TO]->(KandjiTenant)
+    ```
