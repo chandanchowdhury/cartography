@@ -90,6 +90,7 @@ def get_users(token: str, api_url: str, organization: str) -> Tuple[List[Dict], 
         2. data on the owning GitHub organization
         see tests.data.github.users.GITHUB_USER_DATA for shape of both
     """
+    logger.info(f"Retrieving users from GitHub organization {organization}")
     users, org = fetch_all(
         token,
         api_url,
@@ -112,6 +113,7 @@ def get_enterprise_owners(token: str, api_url: str, organization: str) -> Tuple[
         3. data on the owning GitHub organization
         see tests.data.github.users.GITHUB_ENTERPRISE_OWNER_DATA for shape
     """
+    logger.info(f"Retrieving enterprise owners from GitHub organization {organization}")
     owners, org = fetch_all(
         token,
         api_url,
@@ -142,10 +144,13 @@ def transform_users(user_data: List[Dict], owners_data: List[Dict], org_data: Di
 
     users_dict = {}
     for user in user_data:
+        # all members get the 'MEMBER_OF' relationship
         processed_user = deepcopy(user['node'])
-        processed_user['role'] = user['role']
         processed_user['hasTwoFactorEnabled'] = user['hasTwoFactorEnabled']
         processed_user['MEMBER_OF'] = org_data['url']
+        # admins get a second relationship expressing them as such
+        if user['role'] == 'ADMIN':
+            processed_user['ADMIN_OF'] = org_data['url']
         users_dict[processed_user['url']] = processed_user
 
     owners_dict = {}

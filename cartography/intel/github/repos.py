@@ -14,6 +14,8 @@ from packaging.utils import canonicalize_name
 
 from cartography.intel.github.util import fetch_all
 from cartography.intel.github.util import PaginatedGraphqlData
+from cartography.util import backoff_handler
+from cartography.util import retries_with_backoff
 from cartography.util import run_cleanup_job
 from cartography.util import timeit
 
@@ -134,24 +136,17 @@ GITHUB_REPO_COLLABS_PAGINATED_GRAPHQL = """
     """
 
 
-def _get_repo_collaborators_for_multiple_repos(
-        repo_raw_data: list[dict[str, Any]],
-        affiliation: str,
+def _get_repo_collaborators_inner_func(
         org: str,
         api_url: str,
         token: str,
-) -> dict[str, List[UserAffiliationAndRepoPermission]]:
-    """
-    For every repo in the given list, retrieve the collaborators.
-    :param repo_raw_data: A list of dicts representing repos. See tests.data.github.repos.GET_REPOS for data shape.
-    :param affiliation: The type of affiliation to retrieve collaborators for. Either 'DIRECT' or 'OUTSIDE'.
-      See https://docs.github.com/en/graphql/reference/enums#collaboratoraffiliation
-    :param org: The name of the target Github organization as string.
-    :param api_url: The Github v4 API endpoint as string.
-    :param token: The Github API token as string.
-    :return: A dictionary of repo URL to list of UserAffiliationAndRepoPermission
-    """
-    result: dict[str, List[UserAffiliationAndRepoPermission]] = {}
+        repo_raw_data: list[dict[str, Any]],
+        affiliation: str,
+        collab_users: list[dict[str, Any]],
+        collab_permission: list[str],
+) -> dict[str, list[UserAffiliationAndRepoPermission]]:
+    result: dict[str, list[UserAffiliationAndRepoPermission]] = {}
+
     for repo in repo_raw_data:
         repo_name = repo['name']
         repo_url = repo['url']
@@ -162,19 +157,60 @@ def _get_repo_collaborators_for_multiple_repos(
             result[repo_url] = []
             continue
 
-        collab_users = []
-        collab_permission = []
+        logger.info(f"Loading {affiliation} collaborators for repo {repo_name}.")
         collaborators = _get_repo_collaborators(token, api_url, org, repo_name, affiliation)
+
         # nodes and edges are expected to always be present given that we only call for them if totalCount is > 0
-        for collab in collaborators.nodes:
+        # however sometimes GitHub returns None, as in issue 1334 and 1404.
+        for collab in collaborators.nodes or []:
             collab_users.append(collab)
-        for perm in collaborators.edges:
+
+        # The `or []` is because `.edges` can be None.
+        for perm in collaborators.edges or []:
             collab_permission.append(perm['permission'])
 
         result[repo_url] = [
             UserAffiliationAndRepoPermission(user, permission, affiliation)
             for user, permission in zip(collab_users, collab_permission)
         ]
+    return result
+
+
+def _get_repo_collaborators_for_multiple_repos(
+        repo_raw_data: list[dict[str, Any]],
+        affiliation: str,
+        org: str,
+        api_url: str,
+        token: str,
+) -> dict[str, list[UserAffiliationAndRepoPermission]]:
+    """
+    For every repo in the given list, retrieve the collaborators.
+    :param repo_raw_data: A list of dicts representing repos. See tests.data.github.repos.GET_REPOS for data shape.
+    :param affiliation: The type of affiliation to retrieve collaborators for. Either 'DIRECT' or 'OUTSIDE'.
+      See https://docs.github.com/en/graphql/reference/enums#collaboratoraffiliation
+    :param org: The name of the target Github organization as string.
+    :param api_url: The Github v4 API endpoint as string.
+    :param token: The Github API token as string.
+    :return: A dictionary of repo URL to list of UserAffiliationAndRepoPermission
+    """
+    logger.info(f'Retrieving repo collaborators for affiliation "{affiliation}" on org "{org}".')
+    collab_users: List[dict[str, Any]] = []
+    collab_permission: List[str] = []
+
+    result: dict[str, list[UserAffiliationAndRepoPermission]] = retries_with_backoff(
+        _get_repo_collaborators_inner_func,
+        TypeError,
+        5,
+        backoff_handler,
+    )(
+        org=org,
+        api_url=api_url,
+        token=token,
+        repo_raw_data=repo_raw_data,
+        affiliation=affiliation,
+        collab_users=collab_users,
+        collab_permission=collab_permission,
+    )
     return result
 
 
@@ -227,8 +263,9 @@ def get(token: str, api_url: str, organization: str) -> List[Dict]:
 
 
 def transform(
-    repos_json: List[Dict], direct_collaborators: dict[str, List[UserAffiliationAndRepoPermission]],
-    outside_collaborators: dict[str, List[UserAffiliationAndRepoPermission]],
+        repos_json: List[Dict],
+        direct_collaborators: dict[str, List[UserAffiliationAndRepoPermission]],
+        outside_collaborators: dict[str, List[UserAffiliationAndRepoPermission]],
 ) -> Dict:
     """
     Parses the JSON returned from GitHub API to create data for graph ingestion
@@ -256,16 +293,24 @@ def transform(
         _transform_repo_languages(repo_object['url'], repo_object, transformed_repo_languages)
         _transform_repo_objects(repo_object, transformed_repo_list)
         _transform_repo_owners(repo_object['owner']['url'], repo_object, transformed_repo_owners)
-        _transform_collaborators(
-            repo_object['url'], outside_collaborators[repo_object['url']],
-            transformed_outside_collaborators,
-        )
-        _transform_collaborators(
-            repo_object['url'], direct_collaborators[repo_object['url']],
-            transformed_direct_collaborators,
-        )
-        _transform_requirements_txt(repo_object['requirements'], repo_object['url'], transformed_requirements_files)
-        _transform_setup_cfg_requirements(repo_object['setupCfg'], repo_object['url'], transformed_requirements_files)
+
+        # Allow sync to continue if we didn't have permissions to list collaborators
+        repo_url = repo_object['url']
+        if repo_url in outside_collaborators:
+            _transform_collaborators(
+                repo_object['url'],
+                outside_collaborators[repo_object['url']],
+                transformed_outside_collaborators,
+            )
+        if repo_url in direct_collaborators:
+            _transform_collaborators(
+                repo_object['url'],
+                direct_collaborators[repo_object['url']],
+                transformed_direct_collaborators,
+            )
+
+        _transform_requirements_txt(repo_object['requirements'], repo_url, transformed_requirements_files)
+        _transform_setup_cfg_requirements(repo_object['setupCfg'], repo_url, transformed_requirements_files)
     results = {
         'repos': transformed_repo_list,
         'repo_languages': transformed_repo_languages,
@@ -704,12 +749,18 @@ def sync(
     """
     logger.info("Syncing GitHub repos")
     repos_json = get(github_api_key, github_url, organization)
-    direct_collabs = _get_repo_collaborators_for_multiple_repos(
-        repos_json, "DIRECT", organization, github_url, github_api_key,
-    )
-    outside_collabs = _get_repo_collaborators_for_multiple_repos(
-        repos_json, "OUTSIDE", organization, github_url, github_api_key,
-    )
+    direct_collabs: dict[str, list[UserAffiliationAndRepoPermission]] = {}
+    outside_collabs: dict[str, list[UserAffiliationAndRepoPermission]] = {}
+    try:
+        direct_collabs = _get_repo_collaborators_for_multiple_repos(
+            repos_json, "DIRECT", organization, github_url, github_api_key,
+        )
+        outside_collabs = _get_repo_collaborators_for_multiple_repos(
+            repos_json, "OUTSIDE", organization, github_url, github_api_key,
+        )
+    except TypeError:
+        # due to permission errors or transient network error or some other nonsense
+        logger.warning('Unable to list repo collaborators due to permission errors; continuing on.', exc_info=True)
     repo_data = transform(repos_json, direct_collabs, outside_collabs)
     load(neo4j_session, common_job_parameters, repo_data)
     run_cleanup_job('github_repos_cleanup.json', neo4j_session, common_job_parameters)
